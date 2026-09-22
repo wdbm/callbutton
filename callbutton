@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""
+################################################################################
+#                                                                              #
+# callbutton                                                                   #
+#                                                                              #
+################################################################################
+#                                                                              #
+# LICENCE INFORMATION                                                          #
+#                                                                              #
+# This program is a GPT-Live voice assistant.                                  #
+#                                                                              #
+# copyright (C) 2026 William Breaden Madden                                    #
+#                                                                              #
+# This software is released under the terms of the GNU General Public License  #
+# version 3 (GPLv3).                                                           #
+#                                                                              #
+# This program is free software: you can redistribute it and/or modify it      #
+# under the terms of the GNU General Public License as published by the Free   #
+# Software Foundation, either version 3 of the License, or (at your option)    #
+# any later version.                                                           #
+#                                                                              #
+# This program is distributed in the hope that it will be useful, but WITHOUT  #
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or        #
+# FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for     #
+# more details.                                                                #
+#                                                                              #
+# For a copy of the GNU General Public License, see                            #
+# <http://www.gnu.org/licenses>.                                               #
+#                                                                              #
+################################################################################
+
+Usage:
+    callbutton [--input-device=<device>] [--output-device=<device>]
+                [--voice=<voice>] [--backend-model=<model>] [--transcripts]
+    callbutton (-h | --help)
+    callbutton --version
+
+Options:
+    -h --help                   Show this help.
+    --version                   Show the version.
+    --input-device=<device>     Input device index or case-insensitive name fragment.
+    --output-device=<device>    Output device index or case-insensitive name fragment.
+    --voice=<voice>             Voice used for audio output [default: meridian].
+    --backend-model=<model>     Responses model used for delegated work [default: gpt-5-mini].
+    --transcripts               Print input and output transcript fragments.
+"""
+
+import asyncio
+import base64
+from contextlib import suppress
+import os
+import queue
+import signal
+import sys
+import threading
+
+from docopt import docopt
+
+
+__VERSION__ = "2026-09-22T2108Z"
+MODEL         = "gpt-live-1"
+RATE          = 24_000
+CHUNK_MS      = 40
+CHUNK_BYTES   = RATE * 2 * CHUNK_MS // 1000
+INPUT_BLOCKS  = 8
+OUTPUT_BLOCKS = 7
+START_TIMEOUT = 15
+CLOSE_TIMEOUT = 15
+PROMPT = (
+    "You are a personal assistant and private secretary responding to a call button "
+    "on an intercom. Respond in English unless another language is requested. Keep "
+    "spoken replies brisk. Use brief natural acknowledgements, stop speaking when "
+    "interrupted, and listen to the correction."
+)
+LIVE_INSTRUCTIONS_SUFFIX = """
+Backchannel policy: Use moderate, natural acknowledgements without competing with the caller.
+Interruption policy: Stop speaking when the caller interrupts and listen to the correction.
+Delegation policy:
+Backend tools:
+- Current information: search the web for changing or externally sourced facts.
+Delegate to the backend when:
+- The answer needs current information, web search, or careful reasoning.
+- A correction changes backend work already requested.
+Do not delegate to the backend when:
+- You can answer from the conversation or a still-current result.
+- You need a brief clarification to understand the request.
+Delegate before giving an answer that depends on backend work. Do not guess while waiting.
+""".strip()
+BACKEND_INSTRUCTIONS = (
+    "Answer the caller's delegated request accurately and concisely for spoken delivery. "
+    "Use web search whenever the request needs current, changing, or externally sourced "
+    "information. Return facts and relevant source details; do not add conversational filler."
+)
+WEB_SEARCH_TOOL = {"type": "web_search"}
+
+
+class DeviceError(ValueError):
+    pass
+
+
+def session_config(voice, backend_model, timezone):
+    return {
+        "model": MODEL,
+        "instructions": f"{PROMPT}\n\n{LIVE_INSTRUCTIONS_SUFFIX}",
+        "audio": {
+            "format": {"type": "audio/pcm", "rate": RATE},
+            "output": {"voice": voice},
+        },
+        "delegation": {
+            "type": "responses",
+            "responses": {
+                "model": backend_model,
+                "instructions": f"{BACKEND_INSTRUCTIONS} The user's timezone is {timezone}.",
+                "reasoning": {"effort": "low"},
+                "tools": [WEB_SEARCH_TOOL],
+                "tool_choice": "auto",
+                "parallel_tool_calls": False,
+            },
+        },
+    }
+
+
+def device_supports(device, kind):
+    field = "max_input_channels" if kind == "input" else "max_output_channels"
+    return int(device.get(field, 0)) > 0
+
+
+def select_device(specification, kind, devices, sound):
+    if specification is None:
+        try:
+            index = int(sound.default.device[0 if kind == "input" else 1])
+        except (AttributeError, IndexError, TypeError, ValueError):
+            index = -1
+        if index < 0 or index >= len(devices) or not device_supports(devices[index], kind):
+            raise DeviceError(
+                f"the system-default {kind} sound device is unavailable; "
+                f"supply --{kind}-device"
+            )
+    else:
+        try:
+            index = int(specification)
+        except ValueError:
+            wanted = specification.casefold()
+            candidates = [
+                (number, device)
+                for number, device in enumerate(devices)
+                if device_supports(device, kind)
+            ]
+            exact = [
+                number
+                for number, device in candidates
+                if str(device.get("name", "")).casefold() == wanted
+            ]
+            partial = [
+                number
+                for number, device in candidates
+                if wanted in str(device.get("name", "")).casefold()
+            ]
+            matches = exact or partial
+            if not matches:
+                raise DeviceError(f"no {kind} sound device matches {specification!r}")
+            index = matches[0]
+        if index < 0 or index >= len(devices) or not device_supports(devices[index], kind):
+            raise DeviceError(
+                f"sound device {index} is unavailable or does not support {kind}"
+            )
+
+    check = sound.check_input_settings if kind == "input" else sound.check_output_settings
+    try:
+        check(device=index, channels=1, dtype="int16", samplerate=RATE)
+    except Exception as exc:
+        name = devices[index].get("name", "unnamed")
+        raise DeviceError(
+            f"{kind} device {index} ({name}) does not support mono PCM16 at {RATE} Hz: {exc}"
+        ) from exc
+    return index
+
+
+def put_latest(buffer, value):
+    try:
+        buffer.put_nowait(value)
+        return False
+    except (asyncio.QueueFull, queue.Full):
+        with suppress(asyncio.QueueEmpty, queue.Empty):
+            buffer.get_nowait()
+        buffer.put_nowait(value)
+        return True
+
+
+class Audio:
+    def __init__(self, sound, input_device, output_device):
+        self.sound = sound
+        self.input_device = input_device
+        self.output_device = output_device
+        self.loop = asyncio.get_running_loop()
+        self.input = asyncio.Queue(maxsize=INPUT_BLOCKS)
+        self.output = queue.Queue(maxsize=OUTPUT_BLOCKS)
+        self.failed = self.loop.create_future()
+        self.mic = None
+        self.speaker = None
+        self.speaker_thread = None
+        self.input_stopping = threading.Event()
+        self.stopping = threading.Event()
+        self.writing = threading.Event()
+        self.input_drop_reported = False
+        self.output_drop_reported = False
+        self.input_status_reported = False
+        self.output_underflow_reported = False
+
+    def fail(self, error):
+        if not self.failed.done():
+            self.failed.set_exception(error)
+
+    def accept_input(self, raw, status):
+        if self.input_stopping.is_set():
+            return
+        if put_latest(self.input, raw) and not self.input_drop_reported:
+            self.input_drop_reported = True
+            print("[audio] microphone backlog was trimmed", file=sys.stderr)
+        if status and not self.input_status_reported:
+            self.input_status_reported = True
+            print(f"[audio] microphone status: {status}", file=sys.stderr)
+
+    def input_callback(self, data, _frames, _time, status):
+        self.loop.call_soon_threadsafe(self.accept_input, bytes(data), status)
+
+    def input_finished(self):
+        if not self.input_stopping.is_set():
+            self.loop.call_soon_threadsafe(
+                self.fail, RuntimeError("the microphone stream stopped unexpectedly")
+            )
+
+    def play(self, pcm):
+        for offset in range(0, len(pcm), CHUNK_BYTES):
+            dropped = put_latest(self.output, pcm[offset:offset + CHUNK_BYTES])
+            if dropped and not self.output_drop_reported:
+                self.output_drop_reported = True
+                print("[audio] speaker backlog was trimmed", file=sys.stderr)
+
+    def speaker_worker(self):
+        try:
+            self.speaker = self.sound.RawOutputStream(
+                samplerate=RATE,
+                dtype="int16",
+                channels=1,
+                device=self.output_device,
+                latency=0.08,
+            )
+            self.speaker.start()
+            while not self.stopping.is_set() or not self.output.empty():
+                try:
+                    block = self.output.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                self.writing.set()
+                underflowed = self.speaker.write(block)
+                self.writing.clear()
+                if underflowed and not self.output_underflow_reported:
+                    self.output_underflow_reported = True
+                    print("[audio] speaker underflow was detected", file=sys.stderr)
+        except Exception as exc:
+            self.loop.call_soon_threadsafe(self.fail, exc)
+        finally:
+            self.writing.clear()
+            if self.speaker is not None:
+                with suppress(Exception):
+                    self.speaker.stop()
+                with suppress(Exception):
+                    self.speaker.close()
+
+    def start(self):
+        self.speaker_thread = threading.Thread(
+            target=self.speaker_worker,
+            name="callbutton-speaker",
+            daemon=True,
+        )
+        self.speaker_thread.start()
+        try:
+            self.mic = self.sound.RawInputStream(
+                samplerate=RATE,
+                blocksize=RATE * CHUNK_MS // 1000,
+                dtype="int16",
+                channels=1,
+                device=self.input_device,
+                callback=self.input_callback,
+                finished_callback=self.input_finished,
+                latency="low",
+            )
+            self.mic.start()
+        except Exception:
+            self.close(abort=True)
+            raise
+
+    def stop_input(self):
+        self.input_stopping.set()
+        if self.mic is not None:
+            with suppress(Exception):
+                self.mic.stop()
+            with suppress(Exception):
+                self.mic.close()
+            self.mic = None
+
+    async def drain(self):
+        try:
+            async with asyncio.timeout(1):
+                while not self.output.empty() or self.writing.is_set():
+                    await asyncio.sleep(0.01)
+            return True
+        except TimeoutError:
+            return False
+
+    def close(self, abort):
+        self.stop_input()
+        if abort:
+            with suppress(queue.Empty):
+                while True:
+                    self.output.get_nowait()
+        self.stopping.set()
+        if self.speaker_thread is not None:
+            self.speaker_thread.join(timeout=2)
+            if self.speaker_thread.is_alive() and self.speaker is not None:
+                with suppress(Exception):
+                    self.speaker.abort()
+                self.speaker_thread.join(timeout=2)
+        if not self.failed.done():
+            self.failed.cancel()
+
+
+async def wait_for_start(events):
+    try:
+        async with asyncio.timeout(START_TIMEOUT):
+            while True:
+                event = await anext(events)
+                if event.type == "error":
+                    raise RuntimeError(event.error.message)
+                if event.type == "session.started":
+                    return event
+    except StopAsyncIteration as exc:
+        raise RuntimeError("the connection closed before session.started") from exc
+    except TimeoutError as exc:
+        raise RuntimeError("timed out waiting for session.started") from exc
+
+
+async def send_microphone(audio, connection, closing):
+    pending = b""
+    while not closing.is_set():
+        chunk = pending + await audio.input.get()
+        if closing.is_set():
+            return
+        complete = len(chunk) - len(chunk) % 2
+        pending = chunk[complete:]
+        if complete:
+            encoded = base64.b64encode(chunk[:complete]).decode("ascii")
+            await connection.session.input_audio.append(audio=encoded)
+
+
+async def receive(events, audio, transcripts, closed):
+    try:
+        while True:
+            event = await anext(events)
+            if event.type == "error":
+                raise RuntimeError(event.error.message)
+            if event.type == "session.output_audio.delta":
+                pcm = base64.b64decode(event.delta, validate=True)
+                if len(pcm) % 2:
+                    raise RuntimeError("an incomplete PCM16 output sample was received")
+                audio.play(pcm)
+            elif transcripts and event.type in {
+                "session.input_transcript.delta",
+                "session.output_transcript.delta",
+            }:
+                role = "user" if event.type.startswith("session.input") else "assistant"
+                if event.delta:
+                    print(f"[{role}] {event.delta}", flush=True)
+            elif event.type == "session.closed":
+                closed.set()
+                return event.usage
+    except StopAsyncIteration as exc:
+        raise RuntimeError("the connection closed without session.closed") from exc
+
+
+async def run(options, sound, input_device, output_device):
+    from openai import AsyncOpenAI
+
+    closing = asyncio.Event()
+    closed = asyncio.Event()
+    audio = None
+    tasks = []
+    signal_installed = False
+    close_sent = False
+    completed = False
+
+    async with AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"]) as client:
+        async with client.live.connect() as connection:
+            events = connection.__aiter__()
+            await connection.session.start(
+                session=session_config(
+                    options["--voice"],
+                    options["--backend-model"],
+                    os.getenv("TZ", "America/Sao_Paulo"),
+                ),
+                event_id="callbutton_start",
+            )
+            started = await wait_for_start(events)
+            print(f"Session ready: {started.session.id}", file=sys.stderr)
+
+            audio = Audio(sound, input_device, output_device)
+            try:
+                audio.start()
+            except Exception:
+                with suppress(Exception):
+                    await connection.session.close()
+                raise
+
+            loop = asyncio.get_running_loop()
+            try:
+                loop.add_signal_handler(signal.SIGINT, closing.set)
+                signal_installed = True
+            except (NotImplementedError, RuntimeError):
+                pass
+
+            sender = asyncio.create_task(send_microphone(audio, connection, closing))
+            receiver = asyncio.create_task(
+                receive(events, audio, options["--transcripts"], closed)
+            )
+
+            async def close_session():
+                nonlocal close_sent
+                await closing.wait()
+                audio.stop_input()
+                put_latest(audio.input, b"")
+                try:
+                    async with asyncio.timeout(CLOSE_TIMEOUT):
+                        await sender
+                        await connection.session.close()
+                        close_sent = True
+                        await closed.wait()
+                except TimeoutError as exc:
+                    with suppress(Exception):
+                        await connection.close()
+                    raise RuntimeError("timed out waiting for session.closed") from exc
+
+            closer = asyncio.create_task(close_session())
+            tasks = [sender, receiver, closer]
+            watched = {sender, receiver, closer, audio.failed}
+            try:
+                while True:
+                    done, _ = await asyncio.wait(
+                        watched, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if audio.failed in done:
+                        audio.failed.result()
+                    if closer in done:
+                        closer.result()
+                    if receiver in done:
+                        print(f"Final session usage: {receiver.result()}", file=sys.stderr)
+                        completed = True
+                        break
+                    if sender in done:
+                        sender.result()
+                        if not closing.is_set():
+                            raise RuntimeError("the microphone sender stopped unexpectedly")
+                        watched.remove(sender)
+            finally:
+                if signal_installed:
+                    loop.remove_signal_handler(signal.SIGINT)
+                audio.stop_input()
+                if not closed.is_set() and not close_sent:
+                    with suppress(Exception):
+                        await connection.session.close()
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                drained = completed and await audio.drain()
+                audio.close(abort=not drained)
+
+
+async def async_main(options):
+    if not os.environ.get("OPENAI_API_KEY"):
+        print("ERROR: OPENAI_API_KEY is not set.", file=sys.stderr)
+        return 2
+    try:
+        import sounddevice
+
+        devices = sounddevice.query_devices()
+        input_device = select_device(
+            options["--input-device"], "input", devices, sounddevice
+        )
+        output_device = select_device(
+            options["--output-device"], "output", devices, sounddevice
+        )
+        print(
+            f"[microphone] {input_device} ({devices[input_device]['name']}) at {RATE} Hz",
+            file=sys.stderr,
+        )
+        print(
+            f"[speaker] {output_device} ({devices[output_device]['name']}) at {RATE} Hz",
+            file=sys.stderr,
+        )
+        await run(options, sounddevice, input_device, output_device)
+        return 0
+    except DeviceError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+
+def main():
+    try:
+        return asyncio.run(async_main(docopt(__doc__, version=__VERSION__)))
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
