@@ -58,7 +58,7 @@ import threading
 from docopt import docopt
 
 
-__VERSION__ = "2026-09-22T2108Z"
+__VERSION__   = "2026-09-22T2108Z"
 MODEL         = "gpt-live-1"
 RATE          = 24_000
 CHUNK_MS      = 40

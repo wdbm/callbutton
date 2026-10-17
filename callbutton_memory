@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""
+Launch callbutton_memory
+
+Copyright (C) 2026 William Breaden Madden
+SPDX-License-Identifier: GPL-3.0-or-later
+"""
+
+from callbutton_memory_app.cli import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
